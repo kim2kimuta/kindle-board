@@ -1,14 +1,17 @@
-"""Kindle Paperwhite 3 (1072x1448) 向けの「きょうの てんき ＋ きょうは なんの日」画像を生成する。
+"""Kindle Paperwhite 3 (1072x1448) 向けの「今日の 天気 ＋ 今日は 何の日」画像を生成する。
+
+上は天気、下は原稿用紙のマス目に縦書きで「今日は 何の日」を書く。
+フォントは教科書の字に近い Klee One（fonts/ に置く。README 参照）。
 
 使い方:
     python make_board.py                         # 今日（日本時間）、東京
     python make_board.py --date 2026-12-25       # 記念日の表示確認用（天気は取得できる範囲の予報）
-    python make_board.py --lat 34.69 --lon 135.50 --name おおさか
+    python make_board.py --lat 34.69 --lon 135.50 --name 大阪
 """
 import argparse
 import json
 import math
-import os
+import re
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -16,39 +19,47 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 W, H = 1072, 1448
-BODY_SIZE, BODY_LINES = 42, 4  # 「なんの日」説明文の文字サイズと最大行数
+M = 56                       # 左右の余白
 JST = timezone(timedelta(hours=9))
 HERE = Path(__file__).resolve().parent
 WEEKDAYS = "月火水木金土日"
 
-# 太字・通常の順に探す（Windows: BIZ UDゴシック / Ubuntu: Noto Sans CJK）
-FONT_CANDIDATES = {
-    "bold": ["C:/Windows/Fonts/BIZ-UDGothicB.ttc",
-             "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"],
-    "regular": ["C:/Windows/Fonts/BIZ-UDGothicR.ttc",
-                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"],
-}
+# e-ink は16階調。17の倍数の灰色だけを使う
+INK, PENCIL, RULE = 0, 85, 153
 
-# WMO weather code -> (子ども向けの ことば, アイコン種別)
+# 原稿用紙：S ピクセルのマスを ROWS 行、右から COLS 列
+S, ROWS, COLS = 72, 7, 13
+GRID_TOP = H - M - S * ROWS
+GRID_RIGHT = W - (W - S * COLS) // 2
+
+FONTS = {"bold": HERE / "fonts" / "KleeOne-SemiBold.ttf", "regular": HERE / "fonts" / "KleeOne-Regular.ttf"}
+_font_cache = {}
+
+# WMO weather code -> (ことば, アイコン種別)。漢字は1・2年で習うものだけ
 WMO = {
-    0: ("はれ", "sun"), 1: ("はれ", "sun"), 2: ("はれ ときどき くもり", "partly"), 3: ("くもり", "cloud"),
+    0: ("晴れ", "sun"), 1: ("晴れ", "sun"), 2: ("晴れ ときどき くもり", "partly"), 3: ("くもり", "cloud"),
     45: ("きり", "fog"), 48: ("きり", "fog"),
     51: ("きりさめ", "rain"), 53: ("きりさめ", "rain"), 55: ("きりさめ", "rain"),
-    61: ("こさめ", "rain"), 63: ("あめ", "rain"), 65: ("おおあめ", "rain"),
-    66: ("つめたい あめ", "rain"), 67: ("つめたい あめ", "rain"),
-    71: ("こゆき", "snow"), 73: ("ゆき", "snow"), 75: ("おおゆき", "snow"), 77: ("ゆき", "snow"),
-    80: ("にわかあめ", "rain"), 81: ("にわかあめ", "rain"), 82: ("はげしい にわかあめ", "rain"),
-    85: ("にわかゆき", "snow"), 86: ("にわかゆき", "snow"),
+    61: ("小雨", "rain"), 63: ("雨", "rain"), 65: ("大雨", "rain"),
+    66: ("つめたい 雨", "rain"), 67: ("つめたい 雨", "rain"),
+    71: ("小雪", "snow"), 73: ("雪", "snow"), 75: ("大雪", "snow"), 77: ("雪", "snow"),
+    80: ("にわか雨", "rain"), 81: ("にわか雨", "rain"), 82: ("はげしい にわか雨", "rain"),
+    85: ("にわか雪", "snow"), 86: ("にわか雪", "snow"),
     95: ("かみなり", "thunder"), 96: ("かみなり", "thunder"), 99: ("かみなり", "thunder"),
 }
 
+# 縦書きで形や位置を変える文字
+SMALL = set("ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮヵヶ")
+PERIOD = set("、。")
+ROTATE = set("ー～…「」『』（）=")
+HANG = set("、。」』）")     # 列の下にはみ出して書いてよい文字（ぶら下げ）
+
 
 def font(weight, size):
-    for path in FONT_CANDIDATES[weight]:
-        if os.path.exists(path):
-            # Noto CJK の .ttc は index 0 が JP
-            return ImageFont.truetype(path, size, index=0)
-    raise FileNotFoundError(f"no {weight} CJK font found")
+    key = (weight, size)
+    if key not in _font_cache:
+        _font_cache[key] = ImageFont.truetype(str(FONTS[weight]), size)
+    return _font_cache[key]
 
 
 def fetch(lat, lon):
@@ -113,37 +124,74 @@ def draw_icon(d, kind, cx, cy, s):
             d.polygon(pts, fill=0)
 
 
-def wrap(d, text, f, width):
-    """分かち書きの空白で折り返す。1語が幅を超えるときは文字単位で折る。"""
-    lines, cur = [], ""
-    for word in text.split(" "):
-        cand = f"{cur} {word}" if cur else word
-        if d.textlength(cand, font=f) <= width:
-            cur = cand
-            continue
-        if cur:
-            lines.append(cur)
-        cur = ""
-        for ch in word:
-            if d.textlength(cur + ch, font=f) > width:
-                lines.append(cur)
-                cur = ""
-            cur += ch
-    if cur:
-        lines.append(cur)
-    return lines
-
-
 def advice(tmax, tmin, rain):
     if rain >= 50:
-        return "かさを もって いこう"
+        return "かさを もって 行こう"
     if tmax >= 30:
-        return "すいぶんを しっかり とろう"
+        return "水を しっかり のもう"
     if tmin <= 5:
-        return "あたたかく して でかけよう"
+        return "あたたかく して 出かけよう"
     if rain >= 30:
         return "おりたたみがさが あると あんしん"
-    return "げんきに いってらっしゃい！"
+    return "元気に 行ってらっしゃい！"
+
+
+def tokens(text):
+    """マス目1つ分ずつに分ける。分かち書きの空白はつめ、数字は2けたで1マスにする。"""
+    text = text.replace(" ", "").replace("(", "（").replace(")", "）")
+    return re.findall(r"\d{1,2}|.", text)
+
+
+def layout(title, text):
+    """(列, 行, 文字, 太字か) のリストを返す。列は右から0。題名は1マス下げ、本文は1行あけて1マス下げで始める。"""
+    cells, col, row = [], 0, 1
+    for t in tokens(title):
+        if row == ROWS:
+            col, row = col + 1, 1
+        cells.append((col, row, t, True))
+        row += 1
+    col, row = col + 2, 1
+    for t in tokens(text):
+        if row == ROWS and t not in HANG:
+            col, row = col + 1, 0
+        cells.append((col, row, t, False))
+        row += 1
+    return cells
+
+
+def draw_cell(img, d, col, row, t, bold):
+    cx = GRID_RIGHT - S * (col + 0.5)
+    cy = GRID_TOP + S * (row + 0.5)
+    size = int(S * 0.72)
+    f = font("bold" if bold else "regular", size)
+    if len(t) == 2:  # 2けたの数字は横にならべて1マスに入れる
+        d.text((cx, cy), t, font=font("bold" if bold else "regular", int(size * 0.7)), fill=INK, anchor="mm")
+    elif t in SMALL:
+        d.text((cx + size * 0.26, cy - size * 0.3), t, font=f, fill=INK, anchor="mm")
+    elif t in PERIOD:
+        d.text((cx + size * 0.58, cy - size * 0.58), t, font=f, fill=INK, anchor="mm")
+    elif t in ROTATE:
+        mask = Image.new("L", (S, S), 0)
+        ImageDraw.Draw(mask).text((S / 2, S / 2), t, font=f, fill=255, anchor="mm")
+        img.paste(INK, (int(cx - S / 2), int(cy - S / 2)), mask.rotate(-90))
+    else:
+        d.text((cx, cy), t, font=f, fill=INK, anchor="mm")
+
+
+def draw_paper(img, d, kinenbi):
+    """原稿用紙のマス目と、縦書きの「今日は 何の日」。"""
+    d.text((GRID_RIGHT, GRID_TOP - 18), "今日は 何の日？", font=font("bold", 44), fill=INK, anchor="rs")
+    left = GRID_RIGHT - S * COLS
+    for c in range(COLS + 1):
+        x = GRID_RIGHT - S * c
+        d.line((x, GRID_TOP, x, GRID_TOP + S * ROWS), fill=RULE, width=2)
+    for r in range(ROWS + 1):
+        y = GRID_TOP + S * r
+        d.line((left, y, GRID_RIGHT, y), fill=RULE, width=2)
+    d.rectangle((left, GRID_TOP, GRID_RIGHT, GRID_TOP + S * ROWS), outline=PENCIL, width=3)
+    if kinenbi:
+        for cell in layout(kinenbi["title"], kinenbi["text"]):
+            draw_cell(img, d, *cell)
 
 
 def render(day, data, kinenbi, name):
@@ -152,58 +200,45 @@ def render(day, data, kinenbi, name):
     daily, hourly = data["daily"], data["hourly"]
     di = daily["time"].index(day.isoformat()) if day.isoformat() in daily["time"] else None
 
-    # ヘッダー：日付
-    d.text((56, 40), f"{day.month}月{day.day}日", font=font("bold", 120), fill=0)
-    x = 56 + d.textlength(f"{day.month}月{day.day}日", font=font("bold", 120)) + 20
-    d.text((x, 92), f"{WEEKDAYS[day.weekday()]}よう日", font=font("bold", 60), fill=0)
-    d.line((56, 200, W - 56, 200), fill=0, width=5)
+    # 日付
+    date_text = f"{day.month}月{day.day}日"
+    d.text((M, 150), date_text, font=font("bold", 132), fill=INK, anchor="ls")
+    x = M + d.textlength(date_text, font=font("bold", 132)) + 28
+    d.text((x, 150), f"{WEEKDAYS[day.weekday()]}曜日", font=font("bold", 64), fill=INK, anchor="ls")
+    d.line((M, 184, W - M, 184), fill=INK, width=4)
 
-    # きょうの てんき
     if di is not None:
         label, kind = WMO.get(daily["weather_code"][di], ("", "cloud"))
         tmax, tmin = daily["temperature_2m_max"][di], daily["temperature_2m_min"][di]
         rain = daily["precipitation_probability_max"][di] or 0
-        draw_icon(d, kind, 250, 410, 170)
-        d.text((500, 222), f"{name}の てんき", font=font("regular", 34), fill=0)
-        d.text((500, 262), label, font=font("bold", 64), fill=0)
-        d.text((500, 360), "さいこう", font=font("regular", 40), fill=0)
-        d.text((680, 332), f"{tmax:.0f}°", font=font("bold", 92), fill=0)
-        d.text((500, 465), "さいてい", font=font("regular", 40), fill=0)
-        d.text((680, 437), f"{tmin:.0f}°", font=font("bold", 92), fill=0)
-        d.text((500, 560), f"あめの かくりつ  {rain}%", font=font("regular", 42), fill=0)
-        d.rounded_rectangle((56, 620, W - 56, 700), radius=40, outline=0, width=4)
-        d.text((W / 2, 660), advice(tmax, tmin, rain), font=font("bold", 46), fill=0, anchor="mm")
+        draw_icon(d, kind, 240, 350, 150)
+        tx = 480
+        d.text((tx, 250), f"{name}の 天気", font=font("regular", 38), fill=PENCIL, anchor="ls")
+        size = 72
+        while d.textlength(label, font=font("bold", size)) > W - M - tx:
+            size -= 4
+        d.text((tx, 328), label, font=font("bold", size), fill=INK, anchor="ls")
+        for y, word, t in ((432, "さいこう", tmax), (522, "さいてい", tmin)):
+            d.text((tx, y), word, font=font("regular", 40), fill=INK, anchor="ls")
+            d.text((tx + 190, y + 6), f"{t:.0f}°", font=font("bold", 88), fill=INK, anchor="ls")
+        d.text((240, 522), f"雨 {rain}%", font=font("bold", 56), fill=INK, anchor="ms")
+
+        d.rounded_rectangle((M, 552, W - M, 624), radius=36, outline=INK, width=3)
+        d.text((W / 2, 588), advice(tmax, tmin, rain), font=font("bold", 46), fill=INK, anchor="mm")
 
         # 3時間ごと（6時〜21時）
-        top = 720
-        col_w = (W - 112) / 6
+        top = 640
+        col_w = (W - 2 * M) / 6
         for c, hour in enumerate(range(6, 24, 3)):
             i = hourly["time"].index(f"{day.isoformat()}T{hour:02d}:00")
-            cx = 56 + col_w * (c + 0.5)
-            d.text((cx, top + 28), f"{hour}じ", font=font("regular", 36), fill=0, anchor="mm")
-            draw_icon(d, WMO.get(hourly["weather_code"][i], ("", "cloud"))[1], cx, top + 105, 48)
-            d.text((cx, top + 190), f"{hourly['temperature_2m'][i]:.0f}°", font=font("bold", 48), fill=0, anchor="mm")
-            d.text((cx, top + 240), f"{hourly['precipitation_probability'][i]}%", font=font("regular", 30), fill=0, anchor="mm")
+            cx = M + col_w * (c + 0.5)
+            d.text((cx, top + 20), f"{hour}時", font=font("regular", 34), fill=PENCIL, anchor="mm")
+            draw_icon(d, WMO.get(hourly["weather_code"][i], ("", "cloud"))[1], cx, top + 80, 38)
+            d.text((cx, top + 144), f"{hourly['temperature_2m'][i]:.0f}°", font=font("bold", 44), fill=INK, anchor="mm")
     else:
-        d.text((W / 2, 500), "てんきよほうが ありません", font=font("bold", 56), fill=0, anchor="mm")
+        d.text((W / 2, 450), "天気よほうが ありません", font=font("bold", 56), fill=INK, anchor="mm")
 
-    # きょうは なんの日？
-    top = 1020
-    d.line((56, top - 20, W - 56, top - 20), fill=0, width=5)
-    d.rounded_rectangle((56, top, 456, top + 66), radius=33, fill=0)
-    d.text((256, top + 33), "きょうは なんの日？", font=font("bold", 38), fill=255, anchor="mm")
-    k = kinenbi.get(day.strftime("%m-%d"))
-    if k:
-        title_font = font("bold", 72)
-        while d.textlength(k["title"], font=title_font) > W - 112 and title_font.size > 48:
-            title_font = font("bold", title_font.size - 4)
-        d.text((56, top + 82), k["title"], font=title_font, fill=0)
-        body = font("regular", BODY_SIZE)
-        y = top + 180
-        for line in wrap(d, k["text"], body, W - 112)[:BODY_LINES]:
-            d.text((56, y), line, font=body, fill=0)
-            y += 58
-
+    draw_paper(img, d, kinenbi.get(day.strftime("%m-%d")))
     return img
 
 
@@ -212,7 +247,7 @@ def main():
     p.add_argument("--date", type=date.fromisoformat, default=datetime.now(JST).date())
     p.add_argument("--lat", type=float, default=35.68)
     p.add_argument("--lon", type=float, default=139.76)
-    p.add_argument("--name", default="とうきょう")
+    p.add_argument("--name", default="東京")
     p.add_argument("--out", default=str(HERE / "public" / "board.png"))
     a = p.parse_args()
 

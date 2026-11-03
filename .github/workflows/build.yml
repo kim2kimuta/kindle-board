@@ -27,7 +27,12 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - run: sudo apt-get update -q && sudo apt-get install -y -q fonts-noto-cjk
+      - name: fonts (Klee One, SIL OFL)
+        run: |
+          mkdir -p fonts
+          for f in KleeOne-Regular KleeOne-SemiBold; do
+            curl -fsSL --retry 3 -o fonts/$f.ttf "https://github.com/google/fonts/raw/main/ofl/kleeone/$f.ttf"
+          done
       - run: pip install pillow
       - run: python make_board.py
       - uses: actions/configure-pages@v5
