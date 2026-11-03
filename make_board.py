@@ -1,12 +1,12 @@
 """Kindle Paperwhite 3 (1072x1448) 向けの「今日の 天気 ＋ 今日は 何の日」画像を生成する。
 
 上は天気、下は原稿用紙のマス目に縦書きで「今日は 何の日」を書く。
-フォントは教科書の字に近い Klee One（fonts/ に置く。README 参照）。
+フォントは Windows では BIZ UDゴシック、Ubuntu（Actions）では Noto Sans CJK。
 
 使い方:
-    python make_board.py                         # 今日（日本時間）、東京
+    python make_board.py                         # 今日（日本時間）、静岡県駿東郡清水町
     python make_board.py --date 2026-12-25       # 記念日の表示確認用（天気は取得できる範囲の予報）
-    python make_board.py --lat 34.69 --lon 135.50 --name 大阪
+    python make_board.py --lat 34.69 --lon 135.50 --name おおさか
 """
 import argparse
 import json
@@ -32,7 +32,13 @@ S, ROWS, COLS = 72, 7, 13
 GRID_TOP = H - M - S * ROWS
 GRID_RIGHT = W - (W - S * COLS) // 2
 
-FONTS = {"bold": HERE / "fonts" / "KleeOne-SemiBold.ttf", "regular": HERE / "fonts" / "KleeOne-Regular.ttf"}
+# 太字・通常の順に探す（Windows: BIZ UDゴシック / Ubuntu: Noto Sans CJK）
+FONT_CANDIDATES = {
+    "bold": ["C:/Windows/Fonts/BIZ-UDGothicB.ttc",
+             "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"],
+    "regular": ["C:/Windows/Fonts/BIZ-UDGothicR.ttc",
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"],
+}
 _font_cache = {}
 
 # WMO weather code -> (ことば, アイコン種別)。漢字は1・2年で習うものだけ
@@ -58,7 +64,11 @@ HANG = set("、。」』）")     # 列の下にはみ出して書いてよい�
 def font(weight, size):
     key = (weight, size)
     if key not in _font_cache:
-        _font_cache[key] = ImageFont.truetype(str(FONTS[weight]), size)
+        path = next((p for p in FONT_CANDIDATES[weight] if Path(p).exists()), None)
+        if path is None:
+            raise FileNotFoundError(f"no {weight} CJK font found")
+        # Noto CJK の .ttc は index 0 が JP
+        _font_cache[key] = ImageFont.truetype(path, size, index=0)
     return _font_cache[key]
 
 
@@ -245,9 +255,9 @@ def render(day, data, kinenbi, name):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--date", type=date.fromisoformat, default=datetime.now(JST).date())
-    p.add_argument("--lat", type=float, default=35.68)
-    p.add_argument("--lon", type=float, default=139.76)
-    p.add_argument("--name", default="東京")
+    p.add_argument("--lat", type=float, default=35.0990)
+    p.add_argument("--lon", type=float, default=138.9030)
+    p.add_argument("--name", default="しみず町")
     p.add_argument("--out", default=str(HERE / "public" / "board.png"))
     a = p.parse_args()
 
